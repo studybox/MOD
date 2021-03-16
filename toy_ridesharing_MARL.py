@@ -6,12 +6,14 @@ import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 from toy_ridesharing_main import *
 from torch_geometric.data import Data, Dataset, Batch, DataLoader
-from torch_scatter import scatter_mean, scatter_max, scatter_add, scatter_softmax, scatter_log_softmax
+from torch_scatter import scatter_mean, scatter_max, scatter_sum, scatter_softmax, scatter_log_softmax
 import gc
 from collections import deque
 import os
 from a2c_ppo_acktr import utils
 from a2c_ppo_acktr.utils import init
+from a2c_ppo_acktr.distributions import Bernoulli, Categorical, DiagGaussian
+from a2c_ppo_acktr.algo.kfac import KFACOptimizer
 
 PENALTY = PENALTY + 10
 # define RolloutBuffer
@@ -119,14 +121,14 @@ class MGRolloutBuffer(object):
                     self.returns[step] = self.returns[step + 1] * \
                         gamma * self.masks[step + 1] + self.rewards[step]
 
-PAS_LOW = torch.tensor([0, 0, 0, 0, -MAX_WAIT_SEC, -MAX_WAIT_SEC-MAX_DELAY_SEC, 0, -MAX_WAIT_SEC-MAX_DELAY_SEC, 0, 0], dtype=torch.float32)
-PAS_HIG = torch.tensor([20, 20, 20, 20, 0, MAX_WAIT_SEC+MAX_DELAY_SEC, MAX_WAIT_SEC, MAX_WAIT_SEC+MAX_DELAY_SEC, MAX_WAIT_SEC, MAX_DELAY_SEC], dtype=torch.float32)
+PAS_LOW = torch.tensor([0,  0,  0,  0,  0,             0,  0,  0,  0,            0], dtype=torch.float32)
+PAS_HIG = torch.tensor([20, 20, 20, 20, MAX_WAIT_SEC, 40, 40, 40, MAX_WAIT_SEC, MAX_DELAY_SEC], dtype=torch.float32)
 
-REQ_LOW = torch.tensor([0, 0, 0, 0, -MAX_WAIT_SEC, -MAX_WAIT_SEC-MAX_DELAY_SEC, 0, 0], dtype=torch.float32)
-REQ_HIG = torch.tensor([20, 20, 20, 20, 0, MAX_WAIT_SEC+MAX_DELAY_SEC, MAX_WAIT_SEC, MAX_DELAY_SEC], dtype=torch.float32)
+REQ_LOW = torch.tensor([0,  0,  0,  0,  0,            0,  0,            0,              0, 0], dtype=torch.float32)
+REQ_HIG = torch.tensor([20, 20, 20, 20, MAX_WAIT_SEC, 40, MAX_WAIT_SEC, MAX_DELAY_SEC, 1, 1], dtype=torch.float32)
 
-VEH_LOW = torch.tensor([0, 0, 0, 0, 0], dtype=torch.float32)
-VEH_HIG = torch.tensor([10, 1, 20, 20, 4], dtype=torch.float32)
+VEH_LOW = torch.tensor([0, 0, 0, 0 , 0, 0, 0, 0], dtype=torch.float32)
+VEH_HIG = torch.tensor([1, 1, 1, 1, 20, 20, 4, 4], dtype=torch.float32)
 
 REQ2VEH_LOW = torch.tensor([0, 0], dtype=torch.float32)
 REQ2VEH_HIG = torch.tensor([MAX_WAIT_SEC+MAX_DELAY_SEC, 1], dtype=torch.float32)
@@ -135,59 +137,64 @@ REQ2REQ_LOW = torch.tensor([0], dtype=torch.float32)
 REQ2REQ_HIG = torch.tensor([MAX_WAIT_SEC+MAX_DELAY_SEC], dtype=torch.float32)
 
 
-def log_passenger(pas_list, pas, cur_step, delay_time=MAX_DELAY_SEC):
+def log_passenger(pas_list, pas, cur_step, wait_tolerance=MAX_WAIT_SEC, delay_tolerance=MAX_DELAY_SEC):
     pas_list.append([pas.start[0],
                      pas.start[1],
                      pas.dest[0],
                      pas.dest[1],
-                     pas.reqTime - cur_step,
-                     pas.expectedOffTime - cur_step,
-                     pas.scheduledOnTime - cur_step,
-                     pas.scheduledOffTime - cur_step,
-                     MAX_WAIT_SEC,
-                     delay_time])
+                     pas.scheduledOnTime - pas.reqTime,
+                     pas.expectedOffTime - pas.reqTime,
+                     cur_step - pas.scheduledOnTime,
+                     pas.scheduledOffTime - pas.scheduledOnTime,
+                     wait_tolerance,
+                     delay_tolerance])
 
-def log_request(req_list, req, cur_step, delay_time=MAX_DELAY_SEC):
+def log_request(req_list, req, cur_step, centrality, wait_tolerance=MAX_WAIT_SEC, delay_tolerance=MAX_DELAY_SEC):
     req_list.append([req.start[0],
                      req.start[1],
                      req.dest[0],
                      req.dest[1],
-                     req.reqTime - cur_step,
-                     req.expectedOffTime - cur_step,
-                     MAX_WAIT_SEC,
-                     delay_time])
+                     cur_step - req.reqTime,
+                     req.expectedOffTime - req.reqTime,
+                     wait_tolerance,
+                     delay_tolerance,
+                     centrality,
+                     req.assign])
+
+def log_vehicle(veh_feat, veh, ego):
+    veh_feat.append([ego, ego, ego, ego, veh.location[0], veh.location[1], len(veh.passengers), MAX_CAPACITY])
 
 def make_rebalance_requests(location, time):
     #left
-    left_req = Request(-1, (location[0]-1, location[1]),
+    left_req = Request(-1, (location[0], location[1]),
                            (location[0]-1, location[1]),
-                           time-MAX_WAIT_SEC+1)
-    left_req.expectedOffTime = left_req.reqTime
+                           time)
+    left_req.expectedOffTime = left_req.reqTime+1
     #right
-    right_req = Request(-1, (location[0]+1, location[1]),
+    right_req = Request(-1, (location[0], location[1]),
                            (location[0]+1, location[1]),
-                           time-MAX_WAIT_SEC+1)
-    right_req.expectedOffTime =  right_req.reqTime
+                           time)
+    right_req.expectedOffTime =  right_req.reqTime+1
     #up
-    up_req = Request(-1, (location[0], location[1]+1),
+    up_req = Request(-1, (location[0], location[1]),
                            (location[0], location[1]+1),
-                           time-MAX_WAIT_SEC+1)
-    up_req.expectedOffTime =  up_req.reqTime
+                           time)
+    up_req.expectedOffTime =  up_req.reqTime+1
     #down
-    down_req = Request(-1, (location[0], location[1]-1),
+    down_req = Request(-1, (location[0], location[1]),
                            (location[0], location[1]-1),
-                           time-MAX_WAIT_SEC+1)
-    down_req.expectedOffTime =  down_req.reqTime
+                           time)
+    down_req.expectedOffTime =  down_req.reqTime+1
     #stay
     stay_req = Request(-1, (location[0], location[1]),
                            (location[0], location[1]),
-                           time-MAX_WAIT_SEC)
+                           time)
     stay_req.expectedOffTime =  stay_req.reqTime
     return [left_req,right_req,up_req,down_req,stay_req]
 
-def make_assign_request(location, time):
-    virtual_req = Request(-1, location, location, time-MAX_WAIT_SEC+1)
-    virtual_req.expectedOffTime =  virtual_req.reqTime
+def make_assign_request(start, dest, time):
+    virtual_req = Request(-1, start, dest, time)
+    virtual_req.expectedOffTime =  virtual_req.reqTime+1
     return virtual_req
 
 def make_virtual_passenger(unique, location, time):
@@ -228,23 +235,99 @@ def get_reward_cluster(env, all_graph_s, all_graph_a, device="cuda:0"):
         rs[veh_ind][0] = np.exp(-total_dist)
     return torch.tensor(rs, dtype=torch.float).to(device)
 
+def cost(env, act):
+    all_cost = 0.0
+    req_uniques = []
+    for veh, a in zip(env.vehicles, act):
+        if type(a) == list:
+            if len(a) > 0:
+                req_uniques.append(a[0].unique)
+            c = travel(veh, env.cur_step, a, env.traffic, False)
+            assert(c != -1)
+            all_cost += c
+    for req in env.requests:
+        if req.unique not in req_uniques:
+            all_cost += MAX_WAIT_SEC + MAX_DELAY_SEC + 1
+    return req_uniques, all_cost
+
+def alt_action(env, all_graph_s, all_graph_a, veh_ind, alt_req_unique):
+    alt_graph_a = all_graph_a.detach().clone()
+    req_uniques = all_graph_s[veh_ind].request_uniques.cpu().numpy().astype(int)
+    if alt_req_unique in req_uniques:
+        index = np.where(req_uniques==alt_req_unique)[0][0]
+    else:
+        index = len(req_uniques)-1
+    alt_graph_a[veh_ind][0] = index
+    return alt_graph_a
+
+def get_request_reward(env, all_graph_s, all_graph_a, device="cuda:0"):
+    rs = [[0.] for _ in range(len(all_graph_s))]
+    # global request rewards
+    env_acts = get_env_action(env, all_graph_s, all_graph_a, decided=False)
+
+    req_uniques, all_cost = cost(env, env_acts)
+
+    for veh_ind in range(len(all_graph_s)):
+        veh = env.vehicles[veh_ind]
+        a = env_acts[veh_ind]
+        if len(veh.schedulepassengers) == 1:
+            sch_req = veh.schedulepassengers[0]
+            non_acts = alt_action(env, all_graph_s, all_graph_a, veh_ind, sch_req.unique)
+            non_env_acts = get_env_action(env, all_graph_s, non_acts, decided=False)
+            _, non_cost = cost(env, non_env_acts)
+            rs[veh_ind][0] = non_cost - all_cost
+        else:
+            if len(veh.passengers) > 0:
+                non_acts = alt_action(env, all_graph_s, all_graph_a, veh_ind, -10)
+                non_env_acts = get_env_action(env, all_graph_s, non_acts, decided=False)
+                _, non_cost = cost(env, non_env_acts)
+                rs[veh_ind][0] = non_cost - all_cost
+            else:
+                non_acts = alt_action(env, all_graph_s, all_graph_a, veh_ind, -5)
+                non_env_acts = get_env_action(env, all_graph_s, non_acts, decided=False)
+                _, non_cost = cost(env, non_env_acts)
+                rs[veh_ind][0] = non_cost - all_cost
+    return torch.tensor(rs, dtype=torch.float).to(device)/15.
+
+
+def get_passenger_reward(env, all_graph_s, all_graph_a, device="cuda:0"):
+    rs = [[0.] for _ in range(len(all_graph_s))]
+    for veh_ind in range(len(all_graph_s)):
+        veh = env.vehicles[veh_ind]
+        rs[veh_ind][0] = len(veh.passengers)/4.0
+    return torch.tensor(rs, dtype=torch.float).to(device)
+
+def get_centrality_reward(env, all_graph_s, all_graph_a, device="cuda:0"):
+    rs = [[0.] for _ in range(len(env.vehicles))]
+    for veh, s, a, r in zip(env.vehicles, all_graph_s, all_graph_a, rs):
+        req_ind = s.request_inds[a]
+        if req_ind < 0 and req_ind > -10:
+            req_feat = s.requests_x[a].squeeze()
+            cen = req_feat[-2].cpu().item() + 0.5
+            r[0] = cen
+
+    return torch.tensor(rs, dtype=torch.float).to(device)
+
+
+'''
 def get_reward_center(env, all_graph_s, all_graph_a, device="cuda:0"):
     rs = [[0.] for _ in range(len(all_graph_s))]
     for veh_ind in range(len(all_graph_s)):
         veh = env.vehicles[veh_ind]
         loc = veh.get_location()
         a = all_graph_a[veh_ind][0]
-        req_ind = all_graph_s[veh_ind].request_inds[a]
-        if req_ind > 0:
-            rs[veh_ind][0] = -1.
-            continue
-        if req_ind == -1:
+        req_ind = a
+        #req_ind = all_graph_s[veh_ind].request_inds[a]
+        #if req_ind > 0:
+        #    rs[veh_ind][0] = -1.
+        #    continue
+        if req_ind == 0:#-1:
             new_loc = (max(loc[0]-1,0), loc[1])
-        elif req_ind == -2:
+        elif req_ind == 1:#-2:
             new_loc = (min(veh.location[0]+1, env.width-1), loc[1])
-        elif req_ind == -3:
+        elif req_ind == 2:#-3:
             new_loc = (veh.location[0], min(veh.location[1]+1,env.height-1))
-        elif req_ind == -4:
+        elif req_ind == 3:#-4:
             new_loc = (veh.location[0], max(veh.location[1]-1,0))
         else:
             new_loc = (veh.location[0], veh.location[1])
@@ -252,6 +335,111 @@ def get_reward_center(env, all_graph_s, all_graph_a, device="cuda:0"):
             rs[veh_ind][0] = 1.
     return torch.tensor(rs, dtype=torch.float).to(device)
 
+def get_reward_center(env, all_graph_s, all_graph_a, device="cuda:0"):
+    rs = [[0.] for _ in range(len(all_graph_s))]
+    for veh_ind in range(len(all_graph_s)):
+        veh = env.vehicles[veh_ind]
+        loc = veh.get_location()
+        a = all_graph_a[veh_ind][0]
+        req_ind = a
+        req_ind = all_graph_s[veh_ind].request_inds[a]
+        req = all_graph_s[veh_ind].requests_x[a]
+        if req_ind >= 0:
+            rs[veh_ind][0] = -1.
+            continue
+        if req_ind == -1:
+            #print(req[2] - req[0])
+            assert req[2] - req[0] < 0
+            assert req[1] == req[3]
+            new_loc = (max(loc[0]-1,0), loc[1])
+        elif req_ind == -2:
+            #print(req[2] - req[0])
+            assert req[2] - req[0] > 0
+            assert req[1] == req[3]
+            new_loc = (min(loc[0]+1, env.width-1), loc[1])
+        elif req_ind == -3:
+            #print(req[3] - req[1])
+            assert req[3] - req[1] > 0
+            assert req[2] == req[0]
+            new_loc = (loc[0], min(loc[1]+1,env.height-1))
+        elif req_ind == -4:
+            #print(req[3] - req[1])
+            assert req[3] - req[1] < 0
+            assert req[2] == req[0]
+            new_loc = (loc[0], max(loc[1]-1,0))
+        else:
+            new_loc = (loc[0], loc[1])
+        if new_loc[0] >= 8 and new_loc[0] <=12 and new_loc[1] >=8 and new_loc[1] <=12:
+            rs[veh_ind][0] = 1.
+    return torch.tensor(rs, dtype=torch.float).to(device)
+'''
+
+'''
+def get_reward_right(env, all_graph_s, all_graph_a, device="cuda:0"):
+    rs = [[0.] for _ in range(len(all_graph_s))]
+    for veh_ind in range(len(all_graph_s)):
+        veh = env.vehicles[veh_ind]
+        loc = veh.get_location()
+        a = all_graph_a[veh_ind][0]
+        req_ind = a
+        req_ind = all_graph_s[veh_ind].request_inds[a]
+        req = all_graph_s[veh_ind].requests_x[a]
+        if req_ind >= 0:
+            rs[veh_ind][0] = -1.
+            continue
+        if req_ind == -1:
+            #print(req[2] - req[0])
+            assert req[2] - req[0] < 0
+            assert req[1] == req[3]
+            new_loc = (max(loc[0]-1,0), loc[1])
+        elif req_ind == -2:
+            #print(req[2] - req[0])
+            assert req[2] - req[0] > 0
+            assert req[1] == req[3]
+            new_loc = (min(loc[0]+1, env.width-1), loc[1])
+        elif req_ind == -3:
+            #print(req[3] - req[1])
+            assert req[3] - req[1] > 0
+            assert req[2] == req[0]
+            new_loc = (loc[0], min(loc[1]+1,env.height-1))
+        elif req_ind == -4:
+            #print(req[3] - req[1])
+            assert req[3] - req[1] < 0
+            assert req[2] == req[0]
+            new_loc = (loc[0], max(loc[1]-1,0))
+        else:
+            new_loc = (loc[0], loc[1])
+        if new_loc[0] - loc[0] < 0:
+            rs[veh_ind][0] = 1.
+    return torch.tensor(rs, dtype=torch.float).to(device)
+'''
+
+'''
+def get_reward_right(env, all_graph_s, all_graph_a, device="cuda:0"):
+    rs = [[0.] for _ in range(len(all_graph_s))]
+    for veh_ind in range(len(all_graph_s)):
+        veh = env.vehicles[veh_ind]
+        loc = veh.get_location()
+        a = all_graph_a[veh_ind][0]
+        req_ind = a
+        #req_ind = all_graph_s[veh_ind].request_inds[a]
+        #if req_ind > 0:
+        #    rs[veh_ind][0] = -1.
+        #    continue
+        if req_ind == 0:#-1:
+            new_loc = (max(loc[0]-1,0), loc[1])
+        elif req_ind == 1:#-2:
+            new_loc = (min(loc[0]+1, env.width-1), loc[1])
+        elif req_ind == 2:#-3:
+            new_loc = (loc[0], min(loc[1]+1,env.height-1))
+        elif req_ind == 3:#-4:
+            new_loc = (loc[0], max(loc[1]-1,0))
+        else:
+            new_loc = (loc[0], loc[1])
+        if new_loc[1] - loc[1] < 0:
+            rs[veh_ind][0] = 1.
+    return torch.tensor(rs, dtype=torch.float).to(device)
+'''
 #def get_reward_left(env, all_graph_s, all_graph_a, device="cuda:0"):
 #    rs = [[0.] for _ in range(len(all_graph_s))]
 #    for veh_ind in range(len(all_graph_s)):
@@ -271,7 +459,7 @@ def get_reward_center(env, all_graph_s, all_graph_a, device="cuda:0"):
 #            rs[veh_ind][0] = 1.
 #    return torch.tensor(rs, dtype=torch.float).to(device)
 
-
+'''
 def get_reward(env, all_graph_s, all_graph_a_rl, device="cuda:0"):
     env_action = get_env_action(env, all_graph_s, all_graph_a_rl)
     all_graph_a = convert_expert_action(env, all_graph_s, env_action)
@@ -379,7 +567,7 @@ def get_reward(env, all_graph_s, all_graph_a_rl, device="cuda:0"):
                 #else:
                 #    rs[veh_ind][0] = 0.
     return torch.tensor(rs, dtype=torch.float).to(device)/10.
-
+'''
 def convert_expert_action(env, all_graph_s, all_expert_a, device="cuda:0"):
     actions = []
     for veh_ind in range(len(all_graph_s)):
@@ -423,41 +611,122 @@ def convert_expert_action(env, all_graph_s, all_expert_a, device="cuda:0"):
     return torch.tensor(actions, dtype=torch.long).to(device)
 
 
-def get_env_action(env, all_graph_s, all_graph_a):
+def get_env_action(env, all_graph_s, all_graph_a, decided=True):
     expert_actions = []
-    req_veh = {}
-
+    requ_veh = {}
+    veh_reqi = {}
     for veh_ind in range(len(all_graph_s)):
         veh = env.vehicles[veh_ind]
         req_inds = all_graph_s[veh_ind].request_inds.cpu().numpy().astype(int)
         a = all_graph_a[veh_ind][0]
         req_ind = req_inds[a]
         if req_ind >= 0:
-            if req_ind not in req_veh:
-                expert_actions.append([env.requests[req_ind]])
-                cost = travel(veh, env.cur_step, [env.requests[req_ind]], env.traffic, False)
+            req = env.requests[req_ind]
+            if req.unique not in requ_veh:
+                # not conflict\
+                cost = travel(veh, env.cur_step, [req], env.traffic, False)
                 assert(cost != -1)
-                req_veh[req_ind] = (veh_ind, cost)
+                requ_veh[req.unique] = (veh_ind, cost)
+                veh_reqi[veh_ind] = req_ind
             else:
-                cost = travel(veh, env.cur_step, [env.requests[req_ind]], env.traffic, False)
+                # conflict
+                cost = travel(veh, env.cur_step, [req], env.traffic, False)
                 assert(cost != -1)
-                if cost < req_veh[req_ind][1]:
-                    expert_actions.append([env.requests[req_ind]])
-                    if len(env.vehicles[req_veh[req_ind][0]].passengers) > 0:
-                        expert_actions[req_veh[req_ind][0]] = []
+                if cost < requ_veh[req.unique][1]:
+                    veh_reqi[veh_ind] = req_ind
+                    if len(env.vehicles[requ_veh[req.unique][0]].passengers) > 0:
+                        veh_reqi[requ_veh[req.unique][0]] = -10
                     else:
-                        expert_actions[req_veh[req_ind][0]] = env.vehicles[req_veh[req_ind][0]].location
-                    req_veh[req_ind] = (veh_ind, cost)
+                        veh_reqi[requ_veh[req.unique][0]] = -5
+                    requ_veh[req.unique] = (veh_ind, cost)
                 else:
                     if len(veh.passengers) > 0:
-                        expert_actions.append([])
+                        veh_reqi[veh_ind] = -10
                     else:
-                        expert_actions.append(veh.location)
+                        veh_reqi[veh_ind] = -5
         else:
-            if req_ind == -10:
-                expert_actions.append([])
+            veh_reqi[veh_ind] = req_ind
+    # final assignments
+    for veh_ind in range(len(all_graph_s)):
+        veh = env.vehicles[veh_ind]
+        req_ind = veh_reqi[veh_ind]
+        if req_ind >= 0:
+            req = env.requests[req_ind]
+            if len(veh.schedulepassengers) > 0 and veh.schedulepassengers[0].unique == req.unique:
+                # sch == new
+                sch_req = veh.schedulepassengers[0]
+                #print("sch", sch_req.unique)
+                if decided:
+                    assert(req.assign > 0)
+                expert_actions.append([req])
+            elif len(veh.schedulepassengers) > 0:
+                # has schedule req and not same as new
+                sch_req = veh.schedulepassengers[0]
+                #print("sch", sch_req.unique)
+                if sch_req.unique in requ_veh:
+                    # schedule switched to others
+                    expert_actions.append([req])
+                    if decided:
+                        assert(sch_req.assign!=2)#
+                        sch_req.assign = 2
+                        if req.assign == 0:
+                            req.assign = 1
+                else:
+                    # schedule abandoned
+                    expert_actions.append([req])
+                    if decided:
+                        assert(sch_req.assign!=2)
+                        sch_req.assign = 0
+                        sch_req.scheduledOnTime = -1
+                        sch_req.scheduledOffTime = -1
+                        if req.assign == 0:
+                            req.assign = 1
             else:
+                # no schedule
+                expert_actions.append([req])
+                if decided:
+                    if req.assign == 0:
+                        req.assign = 1
 
+        elif req_ind == -10:
+            if len(veh.schedulepassengers) > 0:
+                sch_req = veh.schedulepassengers[0]
+                #print("sch", sch_req.unique)
+                if decided:
+                    assert(sch_req.assign != 2)
+                if sch_req.unique in requ_veh:
+                    # schedule switched to others
+                    expert_actions.append([])
+                    if decided:
+                        sch_req.assign = 2
+                else:
+                    # back to that request
+                    expert_actions.append([sch_req])
+            else:
+                expert_actions.append([])
+        else:
+            if len(veh.schedulepassengers) > 0:
+                sch_req = veh.schedulepassengers[0]
+                if decided:
+                    assert(sch_req.assign != 2)
+                if sch_req.unique in requ_veh:
+                    # schedule switched to others
+                    if req_ind == -1:
+                        expert_actions.append((max(veh.location[0]-1,0), veh.location[1]))
+                    elif req_ind == -2:
+                        expert_actions.append((min(veh.location[0]+1, env.width-1), veh.location[1]))
+                    elif req_ind == -3:
+                        expert_actions.append((veh.location[0], min(veh.location[1]+1,env.height-1)))
+                    elif req_ind == -4:
+                        expert_actions.append((veh.location[0], max(veh.location[1]-1,0)))
+                    else:
+                        expert_actions.append((veh.location[0], veh.location[1]))
+                    if decided:
+                        sch_req.assign = 2
+                else:
+                    # back to that request
+                    expert_actions.append([sch_req])
+            else:
                 if req_ind == -1:
                     expert_actions.append((max(veh.location[0]-1,0), veh.location[1]))
                 elif req_ind == -2:
@@ -468,6 +737,7 @@ def get_env_action(env, all_graph_s, all_graph_a):
                     expert_actions.append((veh.location[0], max(veh.location[1]-1,0)))
                 else:
                     expert_actions.append((veh.location[0], veh.location[1]))
+
     return expert_actions
 
 def get_mean_action(all_graph_s, all_graph_a):
@@ -489,6 +759,92 @@ def get_mean_action(all_graph_s, all_graph_a):
     return mean_actions
 
 
+
+#def log_vehicle(veh_feat, veh, ego, step):
+#    veh_feat.append([step, ego, veh.location[0], veh.location[1], len(veh.passengers)])
+
+def compute_centrality(env, req, rebalance=False):
+    #
+    if rebalance:
+        start = req.start
+        dest = req.dest
+        if dest[0] > start[0]:
+            #right
+            cen = 0
+            for i in range(1, env.width):
+                N = 0
+                dist = 1
+                if start[0]+i >= env.width:
+                    break
+                for req in env.requests:
+                    if req.assign <= 1:
+                        N += 1
+                        dist += env.traffic.get_traveltime((start[0]+i, start[1]), req.start)
+                if cen < N/dist:
+                    cen = N/dist
+        elif dest[0] < start[0]:
+            #left
+            cen = 0
+            for i in range(1, env.width):
+                N = 0
+                dist = 1
+                if start[0]-i < 0:
+                    break
+                for req in env.requests:
+                    if req.assign <= 1:
+                        N += 1
+                        dist += env.traffic.get_traveltime((start[0]-i, start[1]), req.start)
+                if cen < N/dist:
+                    cen = N/dist
+        elif dest[1] > start[0]:
+            #up
+            cen = 0
+            for i in range(1, env.height):
+                N = 0
+                dist = 1
+                if start[1]+i >= env.height:
+                    break
+                for req in env.requests:
+                    if req.assign <= 1:
+                        N += 1
+                        dist += env.traffic.get_traveltime((start[0], start[1]+i), req.start)
+                if cen < N/dist:
+                    cen = N/dist
+        elif dest[1] < start[1]:
+            #down
+            cen = 0
+            for i in range(1, env.height):
+                N = 0
+                dist = 1
+                if start[1]-i < 0:
+                    break
+                for req in env.requests:
+                    if req.assign <= 1:
+                        N += 1
+                        dist += env.traffic.get_traveltime((start[0], start[1]-i), req.start)
+                if cen < N/dist:
+                    cen = N/dist
+        else:
+            #stay
+            N = 0
+            dist = 1
+            for req in env.requests:
+                if req.assign <= 1:
+                    N += 1
+                    dist += env.traffic.get_traveltime(start, req.start)
+            cen = N/dist
+    else:
+        dest = req.dest
+        dist = 1
+        N = 0
+        for req in env.requests:
+            if req.assign <= 1:
+                N += 1
+                dist += env.traffic.get_traveltime(dest, req.start)
+        cen = N/dist
+    return cen
+
+
 def get_state(env, s, device="cuda:0"):
     rvgraph = RVGraph(env.cur_step, s.vehicles, s.requests, env.traffic)
     agents = []
@@ -497,7 +853,9 @@ def get_state(env, s, device="cuda:0"):
         uniques = 0
         veh = s.vehicles[veh_ind]
         req_feat, req_uniques, req_inds = [], [], []
-        veh_feat = [[env.cur_step, 1, veh.location[0], veh.location[1], len(veh.passengers)]]
+        veh_feat = []
+        log_vehicle(veh_feat, veh, 1)
+        #veh_feat = [[env.cur_step, 1, 1, 1, 1, veh.location[0], veh.location[1], len(veh.passengers)]]
         veh_inds = [veh_ind]
         pas_feat = []
         veh_unique_inds = {veh_ind:0}
@@ -513,142 +871,191 @@ def get_state(env, s, device="cuda:0"):
             log_passenger(pas_feat, pas, env.cur_step)
             veh2pas_sender.append(veh_unique_inds[veh_ind])
             veh2pas_receiver.append(pas_unique_inds[pas.unique])
+
         if len(veh.passengers) == 0:
             # add a virtual passenger
             virtual_pas = make_virtual_passenger(env.uniques+uniques, veh.get_location(), env.cur_step)
             pas_unique_inds[virtual_pas.unique] = len(pas_feat)
-            log_passenger(pas_feat, virtual_pas, env.cur_step, 0)
+            log_passenger(pas_feat, virtual_pas, env.cur_step, wait_tolerance=0, delay_tolerance=0)
             veh2pas_sender.append(veh_unique_inds[veh_ind])
             veh2pas_receiver.append(pas_unique_inds[virtual_pas.unique])
             uniques += 1
 
         if rvgraph.has_vehicle(veh_ind):
             # vehicle has active requests nearby
-            # log the requests
-            for req_ind, cost in rvgraph.get_vehicle_edges(veh_ind):
-                req = s.requests[req_ind]
-                req_unique_inds[req_ind] = len(req_feat)
-                log_request(req_feat, req, env.cur_step)
-                req_uniques.append(req.unique)
-                req_inds.append(req_ind)
-                #log req self edge
-                req2req_sender.append(req_unique_inds[req_ind])
-                req2req_receiver.append(req_unique_inds[req_ind])
-                req2req_edge_attr.append([0])
+            if len(veh.passengers) < MAX_CAPACITY:
+                # there is capability
+                # log the requests
+                if len(veh.schedulepassengers) > 0 and veh.schedulepassengers[0].assign == 2:
+                    # the scheduled request has assign status 2
+                    # it must be pickup by this vehicle
+                    sch_req = veh.schedulepassengers[0]
+                    for req_ind, cost in rvgraph.get_vehicle_edges(veh_ind):
+                        req = s.requests[req_ind]
+                        if req.unique == sch_req.unique:
+                            sch_req_ind = req_ind
+                            sch_cost = cost
+                            break
+                    assert(sum([r.unique == req.unique for r in s.requests]) > 0)
+                    req_unique_inds[sch_req_ind] = len(req_feat)
+                    cen = compute_centrality(env, sch_req, rebalance=False)
+                    log_request(req_feat, sch_req, env.cur_step, cen)
+                    req_uniques.append(sch_req.unique)
+                    req_inds.append(sch_req_ind)
+                    #log req self edge
+                    req2req_sender.append(req_unique_inds[sch_req_ind])
+                    req2req_receiver.append(req_unique_inds[sch_req_ind])
+                    req2req_edge_attr.append([0])
+                    #log req to veh edge
+                    req2veh_sender.append(req_unique_inds[sch_req_ind])
+                    req2veh_receiver.append(veh_unique_inds[veh_ind])
+                    req2veh_edge_attr.append([sch_cost, 1.])
 
-                # log the nearby vehicles
-                for nei_ind, cost in rvgraph.req_cost_car[req_ind]:
-                    nei = s.vehicles[nei_ind]
-                    if nei_ind not in veh_unique_inds:
-                        veh_unique_inds[nei_ind] = len(veh_feat)
-                        veh_feat.append([env.cur_step, 0, nei.location[0], nei.location[1], len(nei.passengers)])
-                        veh_inds.append(nei_ind)
-                        # log passengers
-                        for pas in nei.passengers:
-                            if pas.unique in pas_unique_inds:
-                                print(env.vehicles)
-                            assert(pas.unique not in pas_unique_inds)
-                            pas_unique_inds[pas.unique] = len(pas_feat)
-                            log_passenger(pas_feat, pas, env.cur_step)
-                            # log vehicle to passenger edges
-                            veh2pas_sender.append(veh_unique_inds[nei_ind])
-                            veh2pas_receiver.append(pas_unique_inds[pas.unique])
-                        # add virtual passenger
-                        if len(veh.passengers) == 0:
-                            virtual_pas = make_virtual_passenger(env.uniques+uniques, nei.get_location(), env.cur_step)
-                            pas_unique_inds[virtual_pas.unique] = len(pas_feat)
-                            log_passenger(pas_feat, virtual_pas, env.cur_step, 0)
-                            veh2pas_sender.append(veh_unique_inds[nei_ind])
-                            veh2pas_receiver.append(pas_unique_inds[virtual_pas.unique])
-                            uniques += 1
+                else:
+                    #
+                    for req_ind, cost in rvgraph.get_vehicle_edges(veh_ind):
+                        # ignore all requests with status 2
+                        req = s.requests[req_ind]
+                        if req.assign == 2:
+                            continue
+                        assert(req_ind not in req_unique_inds)
+                        req_unique_inds[req_ind] = len(req_feat)
+                        cen = compute_centrality(env, req, rebalance=False)
+                        log_request(req_feat, req, env.cur_step, cen)
+                        req_uniques.append(req.unique)
+                        req_inds.append(req_ind)
+                        #log req self edge
+                        req2req_sender.append(req_unique_inds[req_ind])
+                        req2req_receiver.append(req_unique_inds[req_ind])
+                        req2req_edge_attr.append([0])
+                        #log req to veh edge
+                        req2veh_sender.append(req_unique_inds[req_ind])
+                        req2veh_receiver.append(veh_unique_inds[veh_ind])
+                        if len(veh.schedulepassengers) > 0 and req.unique == veh.schedulepassengers[0].unique:
+                            assert(veh.schedulepassengers[0].assign==1)
+                            req2veh_edge_attr.append([cost, 1.])
+                        else:
+                            req2veh_edge_attr.append([cost, 0.])
 
-                    # log request to vehicle edges
-                    req2veh_sender.append(req_unique_inds[req_ind])
-                    req2veh_receiver.append(veh_unique_inds[nei_ind])
-                    if req.unique in nei.schedulepassengers:
-                        req2veh_edge_attr.append([cost, 1.])
-                    else:
-                        req2veh_edge_attr.append([cost, 0.])
+                        # log the nearby vehicles
+                        for nei_ind, cost in rvgraph.req_cost_car[req_ind]:
+                            nei = s.vehicles[nei_ind]
+                            if len(nei.schedulepassengers) > 0 and nei.schedulepassengers[0].assign == 2:
+                                continue
+                            if nei_ind not in veh_unique_inds and len(nei.passengers) < MAX_CAPACITY:
+                                veh_unique_inds[nei_ind] = len(veh_feat)
+                                log_vehicle(veh_feat, nei, 0)
+                                #veh_feat.append([env.cur_step, 0, 0, 0, 0, nei.location[0], nei.location[1], len(nei.passengers)])
+                                veh_inds.append(nei_ind)
+                                # log passengers
+                                for pas in nei.passengers:
+                                    assert(pas.unique not in pas_unique_inds)
+                                    pas_unique_inds[pas.unique] = len(pas_feat)
+                                    log_passenger(pas_feat, pas, env.cur_step)
+                                    # log vehicle to passenger edges
+                                    veh2pas_sender.append(veh_unique_inds[nei_ind])
+                                    veh2pas_receiver.append(pas_unique_inds[pas.unique])
+                                # add virtual passenger
+                                if len(veh.passengers) == 0:
+                                    virtual_pas = make_virtual_passenger(env.uniques+uniques, nei.get_location(), env.cur_step)
+                                    pas_unique_inds[virtual_pas.unique] = len(pas_feat)
+                                    log_passenger(pas_feat, virtual_pas, env.cur_step, wait_tolerance=0, delay_tolerance=0)
+                                    veh2pas_sender.append(veh_unique_inds[nei_ind])
+                                    veh2pas_receiver.append(pas_unique_inds[virtual_pas.unique])
+                                    uniques += 1
 
-            # log request to request edges
-            for req1_ind, req2_ind, cost in rvgraph.req_inter:
-                if req1_ind in req_unique_inds and req2_ind in req_unique_inds:
-                    req1 = s.requests[req1_ind]
-                    req2 = s.requests[req2_ind]
-                    virtualCar = Vehicle(-1, req1.start)
-                    cost = travel(virtualCar, env.cur_step, [req1,req2], env.traffic, False)
-                    if cost >= 0:
-                        req2req_sender.append(req_unique_inds[req1_ind])
-                        req2req_receiver.append(req_unique_inds[req2_ind])
-                        req2req_edge_attr.append([cost])
+                                # log request to nei vehicle edges
+                                req2veh_sender.append(req_unique_inds[req_ind])
+                                req2veh_receiver.append(veh_unique_inds[nei_ind])
+                                if len(nei.schedulepassengers) > 0 and req.unique == nei.schedulepassengers[0].unique:
+                                    assert(nei.schedulepassengers[0].assign==1)
+                                    req2veh_edge_attr.append([cost, 1.])
+                                else:
+                                    req2veh_edge_attr.append([cost, 0.])
 
-                    virtualCar.set_location(req2.start)
-                    cost = travel(virtualCar, env.cur_step, [req2,req1], env.traffic, False)
-                    if cost >=0:
-                        req2req_sender.append(req_unique_inds[req2_ind])
-                        req2req_receiver.append(req_unique_inds[req1_ind])
-                        req2req_edge_attr.append([cost])
+                    # log request to request edges
+                    for req1_ind, req2_ind, cost in rvgraph.req_inter:
+                        if req1_ind in req_unique_inds and req2_ind in req_unique_inds:
+                            req1 = s.requests[req1_ind]
+                            req2 = s.requests[req2_ind]
+                            virtualCar = Vehicle(-1, req1.start)
+                            cost = travel(virtualCar, env.cur_step, [req1,req2], env.traffic, False)
+                            if cost >= 0:
+                                req2req_sender.append(req_unique_inds[req1_ind])
+                                req2req_receiver.append(req_unique_inds[req2_ind])
+                                req2req_edge_attr.append([cost])
+
+                            virtualCar.set_location(req2.start)
+                            cost = travel(virtualCar, env.cur_step, [req2,req1], env.traffic, False)
+                            if cost >=0:
+                                req2req_sender.append(req_unique_inds[req2_ind])
+                                req2req_receiver.append(req_unique_inds[req1_ind])
+                                req2req_edge_attr.append([cost])
 
         else:
             # vehicle has no active requests nearby
             # perhaps it should be told where the nearest requests are
+            #assert(len(veh.schedulepassengers) == 0)
             pass
         # add rebalance options
-        if len(veh.passengers) == 0:
+        if len(veh.schedulepassengers) == 0 or (len(veh.schedulepassengers) == 1 and veh.schedulepassengers[0].assign == 1):
+            if len(veh.passengers) == 0:
             # add five rebalance virtual requests
-            virtual_reqs = make_rebalance_requests(veh.get_location(), env.cur_step)
-            for i, vir_req in enumerate(virtual_reqs):
-                log_request(req_feat, vir_req, env.cur_step, 0)
-                req_uniques.append(-1-i)
-                req_inds.append(-1-i)
+                virtual_reqs = make_rebalance_requests(veh.get_location(), env.cur_step)
+                for i, vir_req in enumerate(virtual_reqs):
+                    cen = compute_centrality(env, vir_req, rebalance=True)
+                    log_request(req_feat, vir_req, env.cur_step, cen, wait_tolerance = 0, delay_tolerance = 0)
+                    req_uniques.append(-1-i)
+                    req_inds.append(-1-i)
+                    # log virtual req self edge
+                    req2req_sender.append(len(req_feat)-1)
+                    req2req_receiver.append(len(req_feat)-1)
+                    req2req_edge_attr.append([0])
+
+                    # log virtual req to req
+                    #for req_ind, _ in rvgraph.get_vehicle_edges(veh_ind):
+                    #    req = s.requests[req_ind]
+                    #    virtualCar = Vehicle(-1, vir_req.start)
+                    #    cost = travel(virtualCar, env.cur_step, [vir_req,req], env.traffic, False)
+                    #    if cost >= 0:
+                    #        req2req_sender.append(len(req_feat)-1)
+                    #        req2req_receiver.append(req_unique_inds[req_ind])
+                    #        req2req_edge_attr.append([cost])
+
+                    # log virtual req to veh
+                    req2veh_sender.append(len(req_feat)-1)
+                    req2veh_receiver.append(veh_unique_inds[veh_ind])
+                    req2veh_edge_attr.append([0, 0.])
+
+            else:
+                # add one directional virtual request
+                if len(veh.scheduleroute) == 0:
+                    virtual_req = make_assign_request(veh.get_location(), veh.get_location(), env.cur_step)
+                else:
+                    virtual_req = make_assign_request(veh.get_location(), veh.scheduleroute[0][1], env.cur_step)
+                cen = compute_centrality(env, virtual_req, rebalance=False)
+                log_request(req_feat, virtual_req, env.cur_step, cen, wait_tolerance=0, delay_tolerance=0)
+                req_uniques.append(-10)
+                req_inds.append(-10)
+                # log virtual req self edge
                 # log virtual req self edge
                 req2req_sender.append(len(req_feat)-1)
                 req2req_receiver.append(len(req_feat)-1)
                 req2req_edge_attr.append([0])
 
-                # log virtual req to req
-                for req_ind, _ in rvgraph.get_vehicle_edges(veh_ind):
-                    req = s.requests[req_ind]
-                    virtualCar = Vehicle(-1, vir_req.start)
-                    cost = travel(virtualCar, env.cur_step, [vir_req,req], env.traffic, False)
-                    if cost >= 0:
-                        req2req_sender.append(len(req_feat)-1)
-                        req2req_receiver.append(req_unique_inds[req_ind])
-                        req2req_edge_attr.append([cost])
-
+                # log virtual_ req to req
+                #for req_ind, _ in rvgraph.get_vehicle_edges(veh_ind):
+                #    req = s.requests[req_ind]
+                #    virtualCar = Vehicle(-1, virtual_req.start)
+                #    cost = travel(virtualCar, env.cur_step, [virtual_req,req], env.traffic, False)
+                #    if cost >= 0:
+                #        req2req_sender.append(len(req_feat)-1)
+                #        req2req_receiver.append(req_unique_inds[req_ind])
+                #        req2req_edge_attr.append([cost])
                 # log virtual req to veh
                 req2veh_sender.append(len(req_feat)-1)
                 req2veh_receiver.append(veh_unique_inds[veh_ind])
-                req2veh_edge_attr.append([MAX_WAIT_SEC, 0.])
-
-        else:
-            # add one directional virtual request
-            if len(veh.scheduleroute) == 0:
-                virtual_req = make_assign_request(veh.get_location(), env.cur_step-1)
-            else:
-                virtual_req = make_assign_request(veh.scheduleroute[0][1], env.cur_step)
-            log_request(req_feat, virtual_req, env.cur_step, 0)
-            req_uniques.append(-10)
-            req_inds.append(-10)
-            # log virtual req self edge
-            # log virtual req self edge
-            req2req_sender.append(len(req_feat)-1)
-            req2req_receiver.append(len(req_feat)-1)
-            req2req_edge_attr.append([0])
-
-            # log virtual_ req to req
-            for req_ind, _ in rvgraph.get_vehicle_edges(veh_ind):
-                req = s.requests[req_ind]
-                virtualCar = Vehicle(-1, virtual_req.start)
-                cost = travel(virtualCar, env.cur_step, [virtual_req,req], env.traffic, False)
-                if cost >= 0:
-                    req2req_sender.append(len(req_feat)-1)
-                    req2req_receiver.append(req_unique_inds[req_ind])
-                    req2req_edge_attr.append([cost])
-            # log virtual req to veh
-            req2veh_sender.append(len(req_feat)-1)
-            req2veh_receiver.append(veh_unique_inds[veh_ind])
-            req2veh_edge_attr.append([MAX_WAIT_SEC, 0.])
+                req2veh_edge_attr.append([0., 0.])
 
 
         graph_s = RideShareState(request_uniques = torch.tensor(req_uniques, dtype=torch.long),
@@ -684,19 +1091,19 @@ class RideShareState(Data):
         super(RideShareState, self).__init__()
         self.request_uniques = request_uniques
         self.request_inds = request_inds
-        self.requests_x =  (requests_x - REQ_LOW)/(REQ_HIG - REQ_LOW)
-        self.req2req_edge_attr = (req2req_edge_attr - REQ2REQ_LOW)/(REQ2REQ_HIG-REQ2REQ_LOW)
+        self.requests_x =  (requests_x - ((REQ_LOW+REQ_HIG)*0.5))/(REQ_HIG - REQ_LOW)
+        self.req2req_edge_attr = (req2req_edge_attr - ((REQ2REQ_LOW+REQ2REQ_HIG)*0.5))/(REQ2REQ_HIG-REQ2REQ_LOW)
         self.req2req_edge_index = req2req_edge_index
         self.req2req_start_index = torch.tensor([0], dtype=torch.long)
 
         self.vehicle_inds = vehicle_inds
-        self.vehicles_x = (vehicles_x - VEH_LOW)/(VEH_HIG - VEH_LOW)
+        self.vehicles_x = (vehicles_x - ((VEH_LOW+VEH_HIG)*0.5))/(VEH_HIG - VEH_LOW)
         self.req2veh_receiver_start_index = torch.tensor([0], dtype=torch.long)
         self.req2veh_sender_edge_index = req2veh_sender_edge_index
         self.req2veh_receiver_edge_index = req2veh_receiver_edge_index
-        self.req2veh_edge_attr = (req2veh_edge_attr - REQ2VEH_LOW)/(REQ2VEH_HIG - REQ2VEH_LOW)
+        self.req2veh_edge_attr = (req2veh_edge_attr - ((REQ2VEH_LOW+REQ2VEH_HIG)*0.5))/(REQ2VEH_HIG - REQ2VEH_LOW)
 
-        self.passengers_x = (passengers_x - PAS_LOW)/ (PAS_HIG - PAS_LOW)
+        self.passengers_x = (passengers_x - ((PAS_LOW+PAS_HIG)*0.5))/ (PAS_HIG - PAS_LOW)
         self.veh2pas_sender_edge_index = veh2pas_sender_edge_index
         self.veh2pas_receiver_edge_index = veh2pas_receiver_edge_index
 
@@ -804,12 +1211,15 @@ class ReqAddAtt(nn.Module):
 class GraphActor_d(nn.Module):
     def __init__(self, obs_shape, configs):
         super(GraphActor_d, self).__init__()
-        init_ = lambda m: init(m, nn.init.orthogonal_, lambda x: nn.init.
-                               constant_(x, 0), np.sqrt(2))
-        self.phi_req = init_(nn.Linear(obs_shape['req_x'], configs['req_hidden']))
-        self.phi_veh = init_(nn.Linear(obs_shape['veh_x'], configs['veh_hidden']))
+        #init_ = lambda m: init(m, nn.init.orthogonal_, lambda x: nn.init.
+        #                       constant_(x, 0), np.sqrt(2))
+        init_ = lambda m: init(m, nn.init.xavier_normal_, lambda x: nn.init.
+                               constant_(x, 0), nn.init.calculate_gain('tanh'))
+        self.phi_req = nn.Sequential(init_(nn.Linear(obs_shape['req_x'], configs['req_hidden'])), nn.Tanh())
+        self.phi_veh = nn.Sequential(init_(nn.Linear(obs_shape['veh_x'], configs['veh_hidden'])), nn.Tanh())
+        self.phi_pas = nn.Sequential(init_(nn.Linear(obs_shape['pas_x'], configs['pas_hidden'])), nn.Tanh())
 
-        self.actor_linear = nn.Sequential(init_(nn.Linear(configs['req_hidden']+configs['veh_hidden'],
+        self.actor_linear = nn.Sequential(init_(nn.Linear(configs['req_hidden']+configs['veh_hidden']+configs['pas_hidden'],
                                                      configs['act_hidden'])),
                                            nn.Tanh(),
                                            init_(nn.Linear(configs['act_hidden'],
@@ -820,20 +1230,32 @@ class GraphActor_d(nn.Module):
     def forward(self, inputs):
         req_feat = self.phi_req(inputs.requests_x)
         veh_feat = self.phi_veh(inputs.vehicles_x)
+        pas_feat = self.phi_pas(inputs.passengers_x)
+        pas_mean = scatter_mean(pas_feat[inputs.veh2pas_receiver_edge_index],
+                                inputs.veh2pas_sender_edge_index,
+                                dim=0,
+                                dim_size=inputs.vehicles_x.size(0))
+        veh_feat = torch.cat([veh_feat, pas_mean], dim=-1)
         src, dest = inputs.req2veh_sender_edge_index, inputs.req2veh_receiver_edge_index
         veh_feat = scatter_mean(veh_feat[dest], src, dim=0, dim_size=inputs.requests_x.size(0))
-        return self.actor_linear(torch.cat([req_feat, veh_feat], dim=-1))
+        self.action_feat = torch.cat([req_feat, veh_feat], dim=-1)
+        #self.action_feat = req_feat
+        return self.actor_linear(self.action_feat)
 
 class GraphCritic_d(nn.Module):
     def __init__(self, obs_shape, configs):
         super(GraphCritic_d, self).__init__()
-        init_ = lambda m: init(m, nn.init.orthogonal_, lambda x: nn.init.
-                               constant_(x, 0), np.sqrt(2))
+        #init_ = lambda m: init(m, nn.init.orthogonal_, lambda x: nn.init.
+        #                       constant_(x, 0), np.sqrt(2))
+        init_ = lambda m: init(m, nn.init.xavier_normal_, lambda x: nn.init.
+                               constant_(x, 0), nn.init.calculate_gain('tanh'))
+
         # request network
-        self.phi_req = init_(nn.Linear(obs_shape['req_x'], configs['req_hidden']))
-        self.phi_veh = init_(nn.Linear(obs_shape['veh_x'], configs['veh_hidden']))
+        self.phi_req = nn.Sequential(init_(nn.Linear(obs_shape['req_x'], configs['req_hidden'])), nn.Tanh())
+        self.phi_veh = nn.Sequential(init_(nn.Linear(obs_shape['veh_x'], configs['veh_hidden'])), nn.Tanh())
+        self.phi_pas = nn.Sequential(init_(nn.Linear(obs_shape['pas_x'], configs['pas_hidden'])), nn.Tanh())
         # critic network
-        self.critic_linear = nn.Sequential(init_(nn.Linear(configs['req_hidden']+configs['veh_hidden'],
+        self.critic_linear = nn.Sequential(init_(nn.Linear(configs['req_hidden']+configs['veh_hidden']*2+configs['pas_hidden'],
                                                      configs['act_hidden'])),
                                            nn.Tanh(),
                                            init_(nn.Linear(configs['act_hidden'],
@@ -844,12 +1266,25 @@ class GraphCritic_d(nn.Module):
 
     def forward(self, inputs):
         req_feat = self.phi_req(inputs.requests_x)
+        req_feat = scatter_mean(req_feat, inputs.requests_x_batch, dim=0)
         #req_feat = req_feat[inputs.req2req_action_index]
-        src, dest = inputs.req2veh_sender_edge_index, inputs.req2veh_receiver_edge_index
+        #src, dest = inputs.req2veh_sender_edge_index, inputs.req2veh_receiver_edge_index
         veh_feat = self.phi_veh(inputs.vehicles_x)
-        veh_feat = scatter_mean(veh_feat[dest], src, dim=0, dim_size=inputs.requests_x.size(0))
-        action_feat = torch.cat([req_feat, veh_feat], dim=-1)
-        return self.critic_linear(action_feat[inputs.req2req_action_index])
+
+        pas_feat = self.phi_pas(inputs.passengers_x)
+        pas_mean = scatter_mean(pas_feat[inputs.veh2pas_receiver_edge_index],
+                                inputs.veh2pas_sender_edge_index,
+                                dim=0,
+                                dim_size=inputs.vehicles_x.size(0))
+        ego_feat = torch.cat([veh_feat, pas_mean], dim=-1)[inputs.req2veh_receiver_start_index]
+        veh_mean = scatter_mean(veh_feat, inputs.vehicles_x_batch, dim=0)
+        #veh_feat = scatter_mean(veh_feat[dest], src, dim=0, dim_size=inputs.requests_x.size(0))
+        #self.action_feat = torch.cat([req_feat, veh_feat], dim=-1)[inputs.req2req_action_index]
+        #self.action_feat = req_feat[inputs.req2req_action_index]
+        self.action_feat = torch.cat([req_feat, ego_feat, veh_mean], dim=-1)
+        #self.action_feat,_ = scatter_max(req_feat, inputs.requests_x_batch, dim=0)
+
+        return self.critic_linear(self.action_feat)
 
 class GraphActor(nn.Module):
     def __init__(self, obs_shape, configs):
@@ -955,18 +1390,42 @@ class GraphACModel(nn.Module):
     def forward(self, inputs, rnn_hxs, masks):
         raise NotImplementedError
 
+    def sample(self, probs, inds, batch_size):
+        actions = []
+        log_probs = []
+        for i in range(batch_size):
+            probs_ = probs[inds==i].squeeze(1)
+            #print("P", probs_)
+            dist = torch.distributions.Categorical(probs_)
+            a = dist.sample()
+            #print("A", a)
+            actions.append(a)
+            #print("L", dist.log_prob(a))
+            log_probs.append(dist.log_prob(a))
+        actions = torch.stack(actions).unsqueeze(1)
+        log_probs = torch.stack(log_probs).unsqueeze(1)
+        #print("AC", actions)
+        #print("LP ", log_probs)
+        #raise
+        return actions, log_probs
+
     def act(self, inputs, deterministic=False):
         actor_logits = self.actor(inputs)
 
         log_probs = scatter_log_softmax(actor_logits,
                                            inputs.requests_x_batch,
                                            dim=0)
-        action_log_probs, action = scatter_max(log_probs, inputs.requests_x_batch, dim=0)
+        probs = scatter_softmax(actor_logits, inputs.requests_x_batch, dim=0)
+        #print("inds ", inputs.requests_x_batch)
+        #print("probs", [probs[inputs.requests_x_batch==i].squeeze() for i in range(inputs.req2req_start_index.size(0))])
+        #print("log_probs", [log_probs[inputs.requests_x_batch==i].squeeze() for i in range(inputs.req2req_start_index.size(0))])
+        action, action_log_probs = self.sample(probs, inputs.requests_x_batch, inputs.req2req_start_index.size(0))
+        #action_log_probs, action = scatter_max(log_probs, inputs.requests_x_batch, dim=0)
         #if deterministic:
         #    action = dist.mode()
         #else:
         #    action = dist.sample()
-        action = action - inputs.req2req_start_index.unsqueeze(1)
+        #action = action - inputs.req2req_start_index.unsqueeze(1)
         return action, action_log_probs
 
     def get_value(self, inputs):
@@ -980,11 +1439,53 @@ class GraphACModel(nn.Module):
         log_probs = scatter_log_softmax(actor_logits,
                                            inputs.requests_x_batch,
                                            dim=0)
+        #print("action we get: ", inputs.req2req_action_index)
+        #print("action we get: ", inputs.req2req_action_index - inputs.req2req_start_index)
+
         action_log_probs = log_probs[inputs.req2req_action_index]
         probs = scatter_softmax(actor_logits, inputs.requests_x_batch, dim=0)
-        dist_entropy = scatter_mean(-probs*log_probs, inputs.requests_x_batch, dim=0).mean()
+        dist_entropy = scatter_sum(-probs*log_probs, inputs.requests_x_batch, dim=0).mean()
 
         return value, action_log_probs, dist_entropy
+
+class MLPActor_d(nn.Module):
+    def __init__(self, obs_shape, configs):
+        super(MLPActor_d, self).__init__()
+        init_ = lambda m: init(m, nn.init.orthogonal_, lambda x: nn.init.
+                               constant_(x, 0), np.sqrt(2))
+        self.phi_veh = init_(nn.Linear(obs_shape['veh_x'], configs['veh_hidden']))
+
+        self.actor_linear = nn.Sequential(init_(nn.Linear(configs['veh_hidden'],
+                                                     configs['act_hidden'])),
+                                           nn.Tanh(),
+                                           init_(nn.Linear(configs['act_hidden'],
+                                                     configs['act_hidden'])),
+                                           nn.Tanh())
+
+    def forward(self, inputs):
+        veh_feat = self.phi_veh(inputs.vehicles_x[inputs.req2veh_receiver_start_index])
+
+        return self.actor_linear(veh_feat)
+
+class MLPCritic_d(nn.Module):
+    def __init__(self, obs_shape, configs):
+        super(MLPCritic_d, self).__init__()
+        init_ = lambda m: init(m, nn.init.orthogonal_, lambda x: nn.init.
+                               constant_(x, 0), np.sqrt(2))
+        self.phi_veh = init_(nn.Linear(obs_shape['veh_x'], configs['veh_hidden']))
+        # critic network
+        self.critic_linear = nn.Sequential(init_(nn.Linear(configs['veh_hidden'],
+                                                     configs['act_hidden'])),
+                                           nn.Tanh(),
+                                           init_(nn.Linear(configs['act_hidden'],
+                                                     configs['act_hidden'])),
+                                           nn.Tanh(),
+                                           init_(nn.Linear(configs['act_hidden'], 1))
+        )
+
+    def forward(self, inputs):
+        veh_feat = self.phi_veh(inputs.vehicles_x[inputs.req2veh_receiver_start_index])
+        return self.critic_linear(veh_feat)
 
 class MLPACModel(nn.Module): # we need to first make sure the A2C is correct
     def __init__(self, obs_shape, configs):
@@ -992,22 +1493,23 @@ class MLPACModel(nn.Module): # we need to first make sure the A2C is correct
 
         self.actor = MLPActor_d(obs_shape, configs)
         self.critic = MLPCritic_d(obs_shape, configs)
+        self.dist = Categorical(configs['act_hidden'], 5)
+
     def forward(self, inputs, rnn_hxs, masks):
         raise NotImplementedError
 
     def act(self, inputs, deterministic=False):
-        actor_logits = self.actor(inputs)
-
-        log_probs = scatter_log_softmax(actor_logits,
-                                           inputs.requests_x_batch,
-                                           dim=0)
-        
-        action_log_probs, action = scatter_max(log_probs, inputs.requests_x_batch, dim=0)
+        actor_feat = self.actor(inputs)
+        dist  = self.dist(actor_feat)
+        #print("probs", dist.probs)
+        #action = dist.mode()
+        action = dist.sample()
         #if deterministic:
         #    action = dist.mode()
         #else:
         #    action = dist.sample()
-        action = action - inputs.req2req_start_index.unsqueeze(1)
+        #action = action - inputs.req2req_start_index.unsqueeze(1)
+        action_log_probs = dist.log_probs(action)
         return action, action_log_probs
 
     def get_value(self, inputs):
@@ -1016,15 +1518,14 @@ class MLPACModel(nn.Module): # we need to first make sure the A2C is correct
 
     def evaluate_actions(self, inputs):
         value = self.critic(inputs)
-        actor_logits = self.actor(inputs)
+        actor_feat = self.actor(inputs)
 
-        log_probs = scatter_log_softmax(actor_logits,
-                                           inputs.requests_x_batch,
-                                           dim=0)
-        action_log_probs = log_probs[inputs.req2req_action_index]
-        probs = scatter_softmax(actor_logits, inputs.requests_x_batch, dim=0)
-        dist_entropy = scatter_mean(-probs*log_probs, inputs.requests_x_batch, dim=0).mean()
+        dist = self.dist(actor_feat)
 
+        action = inputs.req2req_action_index - inputs.req2req_start_index
+        action = action.unsqueeze(1)
+        action_log_probs = dist.log_probs(action)
+        dist_entropy = dist.entropy().mean()
         return value, action_log_probs, dist_entropy
 
 # define agent
@@ -1045,7 +1546,7 @@ class MGACK(object):
         self.max_grad_norm = configs['max_grad_norm']
 
         if acktr:
-            self.optimizer = KFACOptimizer(actor_critic)
+            self.optimizer = KFACOptimizer(actor_critic, lr=configs['lr'], weight_decay=configs['weight_decay'])
         else:
             self.optimizer = optim.RMSprop(
                 actor_critic.parameters(), configs['lr'], eps=configs['eps'], alpha=configs['alpha'])
@@ -1053,11 +1554,34 @@ class MGACK(object):
     def update(self, rollouts):
         dataloader = rollouts.feed_forward_dataloader()
         for sample in dataloader:
+            #print("action we give :", rollouts.actions)
             values, action_log_probs, dist_entropy = self.actor_critic.evaluate_actions(sample)
+            #print("v", values.size())
+            #print("ret", sample.returns.unsqueeze(1).size())
+            #print("ap", action_log_probs.size())
             advantages = sample.returns.unsqueeze(1) - values
             value_loss = advantages.pow(2).mean()
-
+            #print("  act: ", sample.request_inds[sample.req2req_action_index])
+            #print("  act: ", sample.req2req_action_index - sample.req2req_start_index)
+            #print("  ret: ", sample.returns.squeeze())
+            #print("  val: ", values.squeeze())
+            #print("  ad: ", advantages.squeeze())
+            #print("  ap: ", action_log_probs.squeeze())
             action_loss = -(advantages.detach() * action_log_probs).mean()
+            #print("  lo:", action_loss)
+            '''
+            with torch.no_grad():
+                print("  cri act feat: ", self.actor_critic.critic.action_feat)
+                x = self.actor_critic.critic.action_feat
+                for module in self.actor_critic.critic.critic_linear:
+                    x = module(x)
+                    print(" cri act linear feat: ", x)
+                print("  ac act feat: ", self.actor_critic.actor.action_feat)
+                x = self.actor_critic.actor.action_feat
+                for module in self.actor_critic.actor.actor_linear:
+                    x = module(x)
+                    print(" ac act linear feat: ", x)
+            '''
 
             if self.acktr and self.optimizer.steps % self.optimizer.Ts == 0:
                 # Compute fisher, see Martens 2014
@@ -1100,13 +1624,18 @@ class Runner(object):
 
     def run(self, episode):
         # reset environment
-        obs = self.env.reset()
-        #obs = self.env.current_state
+        #obs = self.env.reset()
+        if self.env.cur_step > 50:
+            obs = self.env.reset()
+        else:
+            obs = self.env.current_state
         graph_obs = get_state(self.env, obs)
         self.rollouts.obs[0] = graph_obs
         episode_rewards = []
         for step in range(self.num_steps):
             # sample actions
+            print("obs:", [self.env.vehicles[int(obs.vehicle_inds[0].cpu().item())].get_location() for obs in self.rollouts.obs[step]])
+
             if self.expert_agent and episode < 100 and False:
                 actions = self.expert_agent.act(obs, 0)
                 graph_actions = convert_expert_action(self.env, self.rollouts.obs[step], actions)
@@ -1123,18 +1652,46 @@ class Runner(object):
                     graph_actions, action_log_probs = self.rl_agent.actor_critic.act(
                         Batch.from_data_list(self.rollouts.obs[step],['requests_x', 'vehicles_x','passengers_x'])
                     )
+                    print("act: ", [obs.request_inds[a].cpu().item() for obs, a in zip(self.rollouts.obs[step], graph_actions)])
+                    #print("act:", [a.cpu().item() for a in graph_actions])
+
+                    '''
+                    actions = []
+                    for veh_ind in range(len(self.rollouts.obs[step])):
+                        assert(veh_ind == self.rollouts.obs[step][veh_ind].vehicle_inds[0])
+                        a = graph_actions[veh_ind][0]
+                        veh = self.env.vehicles[veh_ind]
+                        loc = veh.get_location()
+                        if a == 0:
+                            new_loc = (max(loc[0]-1,0), loc[1])
+                        elif a == 1:
+                            new_loc = (min(veh.location[0]+1, self.env.width-1), loc[1])
+                        elif a == 2:
+                            new_loc = (veh.location[0], min(veh.location[1]+1,self.env.height-1))
+                        elif a == 3:
+                            new_loc = (veh.location[0], max(veh.location[1]-1,0))
+                        else:
+                            #print(a)
+                            assert(a == 4)
+                            new_loc = (veh.location[0], veh.location[1])
+                        actions.append(new_loc)
+                    '''
                     actions = get_env_action(self.env, self.rollouts.obs[step], graph_actions)
                     #TODO temp
-
-                    mean_actions = get_mean_action(self.rollouts.obs[step], graph_actions)
+                    print("act: ", actions)
+                    #mean_actions = get_mean_action(self.rollouts.obs[step], graph_actions)
                     for veh_ind in range(len(self.rollouts.obs[step])):
                         self.rollouts.obs[step][veh_ind].req2req_action_index = graph_actions[veh_ind]
-                        self.rollouts.obs[step][veh_ind].vehicle_action = mean_actions[veh_ind]
+                        #self.rollouts.obs[step][veh_ind].vehicle_action = mean_actions[veh_ind]
                     values = self.rl_agent.actor_critic.get_value(
                         Batch.from_data_list(self.rollouts.obs[step],
                             ['requests_x', 'vehicles_x','passengers_x'])
                     )
-            rewards = get_reward_center(self.env, graph_obs, graph_actions)
+            rewards = get_centrality_reward(self.env, graph_obs, graph_actions)
+            #rewards = get_passenger_reward(self.env, graph_obs, graph_actions)
+            #rewards = get_request_reward(self.env, graph_obs, graph_actions)
+
+            print("r: ", rewards.squeeze(), " \n")
             self.env.execute_agent_action(actions)
             infos = get_info(self.env)
             obs, done = get_done(self.env)
@@ -1155,10 +1712,10 @@ class Runner(object):
             graph_actions, action_log_prob = self.rl_agent.actor_critic.act(
                 Batch.from_data_list(self.rollouts.obs[-1], ['requests_x', 'vehicles_x','passengers_x'])
             )
-            mean_actions = get_mean_action(self.rollouts.obs[-1], graph_actions)
+            #mean_actions = get_mean_action(self.rollouts.obs[-1], graph_actions)
             for veh_ind in range(len(self.rollouts.obs[-1])):
                 self.rollouts.obs[-1][veh_ind].req2req_action_index = graph_actions[veh_ind]
-                self.rollouts.obs[-1][veh_ind].vehicle_action = mean_actions[veh_ind]
+                #self.rollouts.obs[-1][veh_ind].vehicle_action = mean_actions[veh_ind]
             next_value = self.rl_agent.actor_critic.get_value(
                     Batch.from_data_list(self.rollouts.obs[-1],
                         ['requests_x', 'vehicles_x','passengers_x'])
@@ -1186,9 +1743,34 @@ def evaluate(actor_critic, env):
             )
         # Obser reward and next obs
         actions = get_env_action(env, graph_obs, graph_actions)
+        '''
+        actions = []
+        for veh_ind in range(len(graph_obs)):
+            assert(veh_ind == graph_obs[veh_ind].vehicle_inds[0])
+            a = graph_actions[veh_ind][0]
+            veh = env.vehicles[veh_ind]
+            loc = veh.get_location()
+            if a == 0:
+                new_loc = (max(loc[0]-1,0), loc[1])
+            elif a == 1:
+                new_loc = (min(veh.location[0]+1, env.width-1), loc[1])
+            elif a == 2:
+                new_loc = (veh.location[0], min(veh.location[1]+1,env.height-1))
+            elif a == 3:
+                new_loc = (veh.location[0], max(veh.location[1]-1,0))
+            else:
+                assert(a == 4)
+                new_loc = (veh.location[0], veh.location[1])
+            actions.append(new_loc)
+        '''
+        rewards = get_centrality_reward(env, graph_obs, graph_actions)
+        #rewards = get_passenger_reward(env, graph_obs, graph_actions)
+        #rewards = get_request_reward(env, graph_obs, graph_actions)
+        #print("obs:", [obs.vehicles_x[0].cpu() for obs in graph_obs])
+        #print("act:", [a.cpu().item() for a in graph_actions])
+        #print("act: ", actions)
+        #print("r: ", rewards.squeeze(), " \n")
 
-        rewards = get_reward_center(env, graph_obs, graph_actions)
-        #print("r: ", rewards.squeeze())
         env.execute_agent_action(actions)
         obs, done = get_done(env)
         last_graph_obs = graph_obs
@@ -1197,8 +1779,9 @@ def evaluate(actor_critic, env):
         eval_episode_rewards.append(rewards.mean().cpu().item())
 
 
-    print("act: ", [obs.request_uniques[a].cpu().item() for obs, a in zip(last_graph_obs, graph_actions)])
-    print("act: ", actions)
+
+    #print("act: ", [obs.request_uniques[a].cpu().item() for obs, a in zip(last_graph_obs, graph_actions)])
+
     #print("r: ", rewards.squeeze())
 
     print(" Evaluation using {} episodes: mean reward {:.5f}\n".format(
@@ -1232,11 +1815,11 @@ def main():
     env = GridWorldRideSharing(num_vehicles=15)
     eval_env = GridWorldRideSharing(num_vehicles=15)
     expert_env = GridWorldRideSharing(num_vehicles=15)
-    actor_critic_model = GraphACModel(obs_shape, configs)
+    actor_critic_model = GraphACModel(obs_shape, configs) #MLPACModel(obs_shape, configs)#
     actor_critic_model.to("cuda:0")
     torch.manual_seed(configs['seed'])
     torch.cuda.manual_seed_all(configs['seed'])
-    rl_agent = MGACK(actor_critic_model, configs)
+    rl_agent = MGACK(actor_critic_model, configs, acktr=True)
     expert_agent = Agent(env)
     expert_agent2 = Agent(expert_env)
     runner = Runner(env, rl_agent, expert_agent, configs['num_steps'])
@@ -1263,7 +1846,7 @@ def main():
 
             torch.save(
                 actor_critic_model.state_dict()
-            , os.path.join(save_path, "toy_ridesharing_center_{}.pt".format(k)))
+            , os.path.join(save_path, "toy_ridesharing_gn_cen2_acktr_batch_gae_tanh{}_lr-{}_l2-{}.pt".format(k, configs['lr'],configs['weight_decay'])))
 
         writer.add_scalar('dist_entropy',dist_entropy, k)
         writer.add_scalar('value_loss', value_loss, k)
@@ -1279,20 +1862,33 @@ def main():
 
         if (configs['eval_interval'] is not None and k % configs['eval_interval'] == 0):
             eval_reward = evaluate(actor_critic_model, eval_env)
+            with torch.no_grad():
+                writer.add_histogram("cri feat", actor_critic_model.critic.action_feat, k)
+                x = actor_critic_model.critic.action_feat
+                for module in actor_critic_model.critic.critic_linear:
+                    x = module(x)
+                    writer.add_histogram("cri "+module.__str__(), x, k)
+                writer.add_histogram("ac feat", actor_critic_model.actor.action_feat)
+                x = actor_critic_model.actor.action_feat
+                for module in actor_critic_model.actor.actor_linear:
+                    x = module(x)
+                    writer.add_histogram("ac "+module.__str__(), x, k)
+
             #expert_reward = demonstrate(expert_agent2, expert_env)
             writer.add_scalar('eval mean reward', eval_reward, k)
             #writer.add_scalar('expert mean reward', expert_reward, k)
 
-configs = {"veh_hidden":32,
-           "req_hidden":32,
-           "pas_hidden":32,
+configs = {"veh_hidden":16,
+           "req_hidden":16,
+           "pas_hidden":16,
            "req2veh_hidden":32,
            "trip_hidden":32,
-           "act_hidden":512,
-           "num_steps":20,
+           "act_hidden":64,
+           "num_steps":10,
            "num_updates":300,
-           "batch_size":32,
-           "lr": 0.005,
+           "batch_size":64,
+           "lr": 0.25,
+           "weight_decay":1e-4,
            "eps":1e-5,
            "alpha":0.99,
            "algo":"a2c",
@@ -1303,14 +1899,15 @@ configs = {"veh_hidden":32,
            "value_loss_coef":0.5,
            "entropy_coef":0.01,
            "max_grad_norm":0.5,
-           "use_gae":False,
+           "use_gae":True,
            "gamma":0.99,
            "gae_lambda":0.95,
            "use_proper_time_limits":False,
            "use_linear_lr_decay":False,
            'seed':36
            }
-obs_shape = {"req_x":8, "veh_x":5, "pas_x":10, "veh_act":8, "req2veh":2, "req_e":1}
+obs_shape = {"req_x":10, "veh_x":8,
+             "pas_x":10, "veh_act":8, "req2veh":2, "req_e":1}
 
 if __name__ == "__main__":
     main()

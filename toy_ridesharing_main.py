@@ -29,6 +29,7 @@ class Vehicle(object):
         self.available = True
         self.passengers = []
         self.scheduleroute = []
+        self.schedulepassengers = []
         self.unique = unique
         self.served_reqs = 0
         self.draw_route = False
@@ -39,8 +40,10 @@ class Vehicle(object):
         return self.location
     def set_location(self, loc):
         self.location = loc
+
     def get_time_to_next_node(self):
-        return self.timeToNextNode
+        return 0#self.timeToNextNode
+
     def get_num_passengers(self):
         return len(self.passengers)
     def __repr__(self):
@@ -71,11 +74,11 @@ class Vehicle(object):
     def update(self, nowTime, newRequests, traffic):
         #if len(self.scheduleroute) == 0:
         #    return []
-        print("veh ", self.unique)
+        #print("veh ", self.unique)
         if self.timeToNextNode <= TIME_STEP:
             while len(self.scheduleroute) > 0:
                 schedTime, nextLoc = self.scheduleroute[0]
-                print("sch, loc ", schedTime, nextLoc)
+                #print("sch, loc ", schedTime, nextLoc)
                 if schedTime <= nowTime:# or schedTime - nowTime <= TIME_STEP:
                     #if len(self.passengers) > 0:
                     #    onboardCnt = 0
@@ -86,14 +89,14 @@ class Vehicle(object):
                     #            onboardCnt -= 1
                     self.location = nextLoc
                     self.scheduleroute.pop(0)
-                    print("here1")
+                    #print("here1")
                 if schedTime > nowTime:
                     self.timeToNextNode = schedTime - nowTime
                     self.available = self.timeToNextNode <= TIME_STEP
-                    print("here2")
+                    #print("here2")
                     break
         else:
-            print("here3")
+            #print("here3")
             self.timeToNextNode -= TIME_STEP
             self.available = self.timeToNextNode < TIME_STEP
             if self.available:
@@ -113,10 +116,17 @@ class Vehicle(object):
             baseTime =  nowTime
 
         newPassengers = []
+        schPassengers = []
         newRequests = []
         for pas in self.passengers:
             if pas.scheduledOnTime > baseTime:
+                assert pas.onBoard ==False
                 newRequests.append(pas)
+                if len(schPassengers) == 0:
+                    schPassengers.append(pas)
+                elif pas.scheduledOnTime < schPassengers[0].scheduledOnTime:
+                    schPassengers[0] = pas
+
             elif pas.scheduledOffTime <= baseTime:
                 self.served_reqs += 1
                 #total_wait_time += pas.scheduledOnTime - pas.reqTime
@@ -124,6 +134,7 @@ class Vehicle(object):
                 pas.onBoard = True
                 newPassengers.append(pas)
         self.passengers = newPassengers
+        self.schedulepassengers = schPassengers
         return newRequests
 
     def set_path(self, now_time, path, traffic):
@@ -209,6 +220,8 @@ class Request(object):
 
         self.expectedOffTime = -1
         self.unique = unique
+        self.assign = 0
+
     def __repr__(self):
         if self.onBoard:
             ret = " pass {} from {} to {} started at {}".format(self.unique, self.start, self.dest, self.reqTime)
@@ -224,8 +237,15 @@ class GridWorldRideSharing(MDP):
         self.num_vehicles = num_vehicles
         self.draw_routes = [i for i in range(min(num_vehicles, 1))]
         self.num_samples = 20000
-        random_ODs = [(randint(0,width*height), randint(0,height*width)) for _ in range(self.num_samples)]
+        self.rng = np.random.RandomState(0)
         self.ODs = defaultdict(lambda: 0)
+        random_ODs = []
+        while len(random_ODs) < self.num_samples:
+            o , d = self.rng.randint(0,width*height), self.rng.randint(0,height*width)
+            x, y = o//self.height, o%self.width
+            if x >= 8 and x <= 12 and y >=8 and y <= 12:
+                random_ODs.append((o, d))
+        #random_ODs = [(self.rng.randint(0,width*height), self.rng.randint(0,height*width)) for _ in range(self.num_samples)]
         for sample in random_ODs:
             self.ODs[sample] += 1
 
@@ -234,7 +254,7 @@ class GridWorldRideSharing(MDP):
         self.cur_step = 0
         self.generate_new_requests()
 
-        self.vehicles = [Vehicle(idx, (randint(0,width), randint(0,height))) for idx in range(self.num_vehicles)]
+        self.vehicles = [Vehicle(idx, (self.rng.randint(0,width), self.rng.randint(0,height))) for idx in range(self.num_vehicles)]
         for veh_ind in self.draw_routes:
             self.vehicles[veh_ind].draw_route = True
         #self.vehicles[0].passengers.append(1)
@@ -259,19 +279,20 @@ class GridWorldRideSharing(MDP):
         return locs
 
     def reset(self):
-        self.vehicles = [Vehicle(idx, (randint(0,width), randint(0,height))) for idx in range(self.num_vehicles)]
+        self.vehicles = [Vehicle(idx, (self.rng.randint(0,self.width), self.rng.randint(0,self.height))) for idx in range(self.num_vehicles)]
         self.requests = []
         self.uniques = 0
         self.cur_step = 0
         self.generate_new_requests()
         self.current_state = State(self.requests, self.vehicles)
+        return self.current_state
 
     def generate_new_requests(self):
         for o in range(self.width*self.height):
             for d in range(self.width*self.height):
                 if o != d:
-                    theta = np.random.beta(1+self.ODs[(o,d)], 1+self.num_samples-self.ODs[(o,d)])
-                    if np.random.uniform() < theta:
+                    theta = self.rng.beta(1+self.ODs[(o,d)], 1+self.num_samples-self.ODs[(o,d)])
+                    if self.rng.uniform() < theta:
                         req = Request(self.uniques,
                                         (o//self.height, o%self.width),
                                         (d//self.height, d%self.width),
@@ -285,7 +306,7 @@ class GridWorldRideSharing(MDP):
         self.update_vehicles(action)
         # update the requests (new generated)
         if self.cur_step % 5 == 0 and self.cur_step <= 50:
-            print("New requests")
+            #print("New requests")
             self.generate_new_requests()
         if self.cur_step % 150 == 0:
             for idx, veh_ind in enumerate(self.draw_routes):
@@ -329,6 +350,7 @@ class GridWorldRideSharing(MDP):
         for req in self.requests:
             if self.cur_step - req.reqTime > MAX_WAIT_SEC:
                 assert(self.cur_step - req.reqTime == MAX_WAIT_SEC+1)
+                assert(req.assign == 0)
                 req.reqTime += 1
                 req.expectedOffTime += 1
                 req.scheduledOnTime = req.scheduledOffTime = -1
@@ -502,7 +524,7 @@ def _draw_vehicle(center_point, num_pass, screen, base_size=20):
     vehicle_shape = []
     vehicle_color = (98, 140, 190, 10)
     request_color = (154, 195, 157, 10)
-    # TODO: draw route out side vehicle box, draw intended passengers 
+    # TODO: draw route out side vehicle box, draw intended passengers
     top_left_point = (center_point[0]-base_size, center_point[1]-base_size)
     vehicle_shape.append(pygame.draw.rect(screen, vehicle_color, top_left_point+(base_size*2,base_size*2), 2))
     if num_pass == 0:
@@ -525,7 +547,7 @@ def _draw_vehicle(center_point, num_pass, screen, base_size=20):
     return vehicle_shape
 
 
-def travel(vehicle, now_time, requests, traffic, decided):
+def travel(vehicle, now_time, requests, traffic, decided, first_req=False):
     targets = set()
     tmp_targets = set()
     src_dst = defaultdict(lambda:[])
@@ -540,7 +562,7 @@ def travel(vehicle, now_time, requests, traffic, decided):
         tmp_targets.add(pas.dest)
 
     #path, schedule
-    now_time = now_time# + vehicle.get_time_to_next_node()
+    now_time = now_time + vehicle.get_time_to_next_node()
 
     visited = {t:0 for t in targets}
     best_path = None
@@ -622,6 +644,17 @@ def travel(vehicle, now_time, requests, traffic, decided):
             #
     #print([req.scheduledOnTime for req in best_schedule])
     if best_cost < float('inf'):#MAX_DELAY_SEC * numReqs+1:
+        if first_req:
+            prevloc = vehicle.get_location()
+            for pidx in range(len(best_path)):
+                if pidx == 0:
+                    for req in requests:
+                        if req.start == prevloc:
+                            return req
+                for req in requests:
+                    if req.start == best_path[pidx]:
+                        return req
+            raise
         if decided:
             prevloc = vehicle.get_location()
             finalPath = []
